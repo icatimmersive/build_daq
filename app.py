@@ -13,13 +13,17 @@ import os
 
 import flask
 from flask import Flask, render_template, Response, request, make_response
+from flask import send_file, send_from_directory
 
 import flask_login
 
 from camera import VideoCamera
 import experiment
-from pose_detection import pose_detection
+# from pose_detection import pose_detection
 from utils import utils
+from tf.tf import TFTree
+from skeleton.skeleton import people, skeleton
+import visualization
 
 import logging
 from logging.handlers import RotatingFileHandler
@@ -48,6 +52,14 @@ class flask_app(object):
         self.login_manager.unauthorized_handler(self.unauthorized_handler)
         self.login_manager.request_loader(self.request_loader)
 
+        self.extrinsic_dict = self.load_extrinsics()
+        self.xform_tree = TFTree()
+
+        for elem in self.extrinsic_dict["extrinsic_params"]:
+            self.xform_tree.add_transform(parent=elem["left"],
+                                    child=elem["right"],
+                                    xform=elem["matrix"])
+
         handler = RotatingFileHandler(
             'logs/status.log', maxBytes=10000, backupCount=99)
         formatter = logging.Formatter(
@@ -61,6 +73,10 @@ class flask_app(object):
         log.addHandler(handler)
 
         self.create_endpoints()
+
+    def load_extrinsics(self):
+        """Load extrinsic matrices from a json file."""
+        return self.um.read_json("extrinsics.json")
 
     def load_users(self):
         """Load users for authorization purposes from the json file."""
@@ -167,6 +183,22 @@ class flask_app(object):
                               "triangulate",
                               self.triangulate)
 
+        self.app.add_url_rule("/draw_matchstick_frame/<int:exp_id>/<int:cam_id>/<int:frame_id>",
+                              "draw_matchstick_frame",
+                              self.skeletons)
+
+        self.app.add_url_rule("/draw_matchsticks/<int:exp_id>/<camera_id>",
+                              "draw_matchsticks",
+                              self.draw_matchsticks)
+
+        self.app.add_url_rule("/make_videofrom_matchsticks/<int:exp_id>/<camera_id>/<int:fps>",
+                              "make_videofrom_matchsticks",
+                              self.make_videofrom_matchsticks)
+
+        self.app.add_url_rule("/get_matchstick_video/<int:exp_id>/<camera_id>",
+                              "get_matchstick_video",
+                              self.get_matchstick_video)
+
         self.app.view_functions['index'] = self.index
         self.app.view_functions['video'] = self.video
         self.app.view_functions['video_feed'] = self.video_feed
@@ -196,6 +228,12 @@ class flask_app(object):
         self.app.view_functions['match_people'] = self.match_people
         self.app.view_functions['make_thumbnails'] = self.make_thumbnails
         self.app.view_functions['triangulate'] = self.triangulate
+        self.app.view_functions['draw_matchstick_frame'] = self.skeletons
+        self.app.view_functions['draw_matchsticks'] = self.draw_matchsticks
+        self.app.view_functions['make_videofrom_matchsticks'] = self.make_videofrom_matchsticks
+        self.app.view_functions['get_matchstick_video'] = self.get_matchstick_video
+
+
 
     def index(self):
         """Render the homepage."""
@@ -295,13 +333,18 @@ class flask_app(object):
         else:
             img = "false.png"
 
+        try:
+            label = exp.metadata["label"]
+        except:
+            label = None
+
         pd_images = exp.metadata["pose_detection"].values()
         user = {"timestamp": id,
                 "date": date,
                 "camera": exp.metadata["number_of_cameras"],
                 "n_images": exp.metadata["number_of_images"],
                 "room": exp.metadata["room"],
-                "label": exp.metadata["label"],
+                "label": label,
                 "image": img,
                 "exp": exp.metadata,
                 "pose_detection_processed_images": pd_images}
@@ -524,17 +567,27 @@ class flask_app(object):
             room_id = 0
 
         devices = self.rooms[room_id]["devices"]
+        devices.sort()
         camera_name = os.path.basename(devices[int(camera_id)])
 
         fname = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                              "data", exp_id, "raw", str(camera_name), "")
         fname_result_joint = os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                                          "data", exp_id, "output", "pose",
-                                          str(camera_name), "")
+                                          "data", exp_id, "output", "pose", "pose",
+                                          str(camera_name))
+        try:
+            self.um.create_folder(fname_result_joint)
+        except:
+            pass
 
         fname_result_img = os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                                        "data", exp_id, "output", "img",
-                                        str(camera_name), "")
+                                        "data", exp_id, "output", "pose", "img",
+                                        str(camera_name))
+
+        try:
+            self.um.create_folder(fname_result_img)
+        except:
+            pass
 
         img_files = list()
         if os.path.exists(fname):
@@ -556,9 +609,21 @@ class flask_app(object):
                 continue
             else:
                 joints = retval[1]
+                img = retval[0]
                 # save joints here
-                # self.um.save_json(blabla)
-                exp.update_metadata(change_pd=True, pd={camera_name: idx})
+                fname_img = os.path.basename(fname)
+                fname_json = fname_img + ".json"
+                fname_img = "{folder}/{f}".format(folder=fname_result_img,
+                                                  f=fname_img)
+                fname_json = "{folder}/{f}".format(folder=fname_result_joint,
+                                                   f=fname_json)
+
+                cv2.imwrite(fname_img, img)
+                self.um.dump_json(fname=fname_json,
+                                  data=joints.tolist(),
+                                  pretty=True)
+                camera_name_full = "/dev/v4l/by-id/" + camera_name
+                exp.update_metadata(change_pd=True, pd={camera_name_full: idx})
 
         return "{n} number of images were processed!".format(n=n-1)
 
@@ -594,6 +659,170 @@ class flask_app(object):
         n = 99999
 
         return "{n} number of images were processed!".format(n=n)
+
+    def make_videofrom_matchsticks(self, exp_id, camera_id, fps):
+        """
+        """
+        v = visualization.visualization()
+        exp = experiment.experiment(new_experiment=False, ts=exp_id)
+        room_name = exp.metadata["room"]
+
+        if room_name.lower() == "cears":
+            room_id = 1
+        elif room_name.lower() == "computer_lab":
+            room_id = 0
+
+        devices = self.rooms[room_id]["devices"]
+        devices.sort()
+        try:
+            cam_name = os.path.basename(devices[int(camera_id)])
+        except Exception as e:
+            print e
+            return "No cam found sorry!a"
+
+        fcamera_path = os.path.join("/dev/v4l/by-id", cam_name)
+        nframes = exp.metadata["number_of_images"][fcamera_path]
+        exp_path = self.um.experiment_path(str(exp_id))
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        pathout = os.path.join(exp_path, "output/pose/video")
+
+        try:
+            self.um.create_folder(pathout)
+        except:
+            pass
+
+        pathout = os.path.join(pathout, cam_name)
+        
+        try:
+            self.um.create_folder(pathout)
+        except:
+            pass
+
+        pathout = os.path.join(pathout, "video.avi")
+        print pathout
+        out = cv2.VideoWriter(pathout, fourcc, fps, (800, 600))
+
+        for frame_id in range(nframes):
+            figure = os.path.join(exp_path,
+                                  "output/pose/img",
+                                  cam_name,
+                                  "matchstick_" + str(frame_id) + ".png")
+            img_ = cv2.imread(figure)
+            
+            if img_ is None:
+
+                return "I think you forgot to draw the matchsticks!"
+            cv2.resize(img_, (800, 600))
+            out.write(img_)
+
+        out.release()
+            
+        return "done"
+
+    def get_matchstick_video(self, exp_id, camera_id):
+        """
+        """
+        exp = experiment.experiment(new_experiment=False, ts=exp_id)
+        room_name = exp.metadata["room"]
+
+        if room_name.lower() == "cears":
+            room_id = 1
+        elif room_name.lower() == "computer_lab":
+            room_id = 0
+
+        devices = self.rooms[room_id]["devices"]
+        devices.sort()
+        try:
+            cam_name = os.path.basename(devices[int(camera_id)])
+        except Exception as e:
+            print e
+            return "No cam found sorry!"
+
+        fcamera_path = os.path.join("/dev/v4l/by-id", cam_name)
+        nframes = exp.metadata["number_of_images"][fcamera_path]
+        exp_path = self.um.experiment_path(str(exp_id))
+        pathout = os.path.join(exp_path, "output/pose/video")
+        pathout = os.path.join(pathout, cam_name)
+
+        try:
+            return send_from_directory(pathout, filename="video.avi",
+                                       as_attachment=True,
+                                       mimetype='video/x-msvideo')
+        except Exception as e:
+            return str(e)
+
+    def draw_matchsticks(self, exp_id, camera_id):
+        """
+        """
+        v = visualization.visualization()
+        exp = experiment.experiment(new_experiment=False, ts=exp_id)
+        room_name = exp.metadata["room"]
+
+        if room_name.lower() == "cears":
+            room_id = 1
+        elif room_name.lower() == "computer_lab":
+            room_id = 0
+
+        devices = self.rooms[room_id]["devices"]
+        devices.sort()
+        try:
+            cam_name = os.path.basename(devices[int(camera_id)])
+        except Exception as e:
+            print e
+            return "No cam found sorry!a"
+
+        fcamera_path = os.path.join("/dev/v4l/by-id", cam_name)
+        nframes = exp.metadata["number_of_images"][fcamera_path]
+        ret_combined = ""
+        for frame_id in range(nframes):
+            ret = self.skeletons(exp_id, camera_id, frame_id)
+            ret_combined += "<br>" + ret
+        return ret_combined
+
+    def skeletons(self, exp_id, cam_id, frame_id):
+        """Test skeletons."""
+        visualizer = visualization.visualization()
+        exp = experiment.experiment(new_experiment=False, ts=exp_id)
+        room_name = exp.metadata["room"]
+        if room_name.lower() == "cears":
+            room_id = 1
+        elif room_name.lower() == "computer_lab":
+            room_id = 0
+
+        devices = self.rooms[room_id]["devices"]
+        devices.sort()
+        try:
+            cam_name = os.path.basename(devices[int(cam_id)])
+        except:
+            return "No cam found sorry!"
+
+        exp_path = self.um.experiment_path(str(exp_id))
+        pose_detection_result = "output/pose"
+        json = "pose"
+        img = "img"
+        fname = os.path.join(exp_path,
+                             pose_detection_result,
+                             json,
+                             cam_name,
+                             str(frame_id)+".png.json")
+
+        
+        output_fname = os.path.join(exp_path,
+                                    pose_detection_result,
+                                    img,
+                                    cam_name,
+                                    "matchstick_" + str(frame_id) + ".png")
+        print fname
+
+        if self.um.check_file_exists(fname):
+            json_data = self.um.read_json(fname)
+            people_in_frame = people(json_data, frame_id)
+            visualizer.draw_matchsticks(people_in_frame, output_fname)
+            npeople = str(len(people_in_frame.list))
+        else:
+            npeople = 0
+
+        return "Number of people drawn: {n}".format(n=npeople)
 
     def triangulate(self, exp_id):
         """Triangulate people's locations."""
